@@ -92,6 +92,9 @@ def tofts_concentration(Cp, dt, Ktrans, ve, vp=0.0):
     Ct = vp * Cp + Ktrans * conv
     return Ct
 
+
+
+
 # ==========================================================
 # === Non-uniform Reference-Tissue AIF =====================
 # ==========================================================
@@ -315,48 +318,6 @@ def main():
     # ACE fit (all frames)
     Kt_ace, ve_ace, vp_ace, T10_ace, B1_ace = fit_voxel_ACE(S_t, FA, TR, Cp_full, dt_uniform=5.4, r1=R1_RELAXIVITY)
 
-    # # ==== Plots ====
-    # # 1) Reference AIFs
-    # plt.figure()
-    # plt.plot(t_b, Cp_b, label="Cp DCE (baseline)")
-    # plt.plot(t_full, Cp_full, label="Cp ACE (full)")
-    # plt.xlabel("Time (s)")
-    # plt.ylabel("Cp (a.u.)")
-    # plt.title("AIF from Reference Tissue (non-uniform)")
-    # plt.legend()
-    # plt.xlim(0, 600)
-    # plt.tight_layout()
-    # plt.savefig(OUTDIR / "aif_reference_nonuniform.png", dpi=200)
-    # plt.close()
-    #
-    # # 2) Voxel enhancement & fits (page 5 style)
-    # # DCE predicted signal on baseline frames
-    # S0_v = float(np.mean(S_base[:5]))
-    # Ct_pred_b = tofts_concentration(Cp_b, 5.4, Kt_dce, ve_dce, vp_dce)
-    # R1_pred_b = (1.0/T10_REF_SEC) + R1_RELAXIVITY * Ct_pred_b
-    # S_pred_dce = spgr_signal(R1_pred_b, S0_v, FA_b, TR_b, TE=3.83e-3, T2star=np.inf, B1=1.0)
-    #
-    # # ACE predicted signal across all frames
-    # S0_all = float(np.mean(S_t[:5]))
-    # Ct_pred_full = tofts_concentration(Cp_full, 5.4, Kt_ace, ve_ace, vp_ace)
-    # R1_pred_full = (1.0/max(T10_ace,1e-6)) + R1_RELAXIVITY * Ct_pred_full
-    # S_pred_ace = spgr_signal(R1_pred_full, S0_all, FA, TR, TE=3.83e-3, T2star=np.inf, B1=B1_ace)
-    #
-    # plt.figure()
-    # plt.plot(np.arange(T), S_t, label="Measured S(t)")
-    # plt.plot(baseline_idx, S_pred_dce, '--', label="DCE fit (baseline)")
-    # plt.plot(np.arange(T), S_pred_ace, '--', label="ACE fit (all frames)")
-    # plt.xlabel("Frame #")
-    # plt.ylabel("Signal")
-    # plt.title(f"Voxel enhancement & fits @ ({i0},{j0})")
-    # plt.legend()
-    # plt.tight_layout()
-    # plt.savefig(OUTDIR / "voxel_enhancement_fits.png", dpi=200)
-    # plt.close()
-
-    # ==========================================================
-    # === Normalized plots with 0–600 s time axis ==============
-    # ==========================================================
 
     total_time = 600  # seconds
     T = len(S_t)
@@ -379,6 +340,8 @@ def main():
 
     # Create DCE time axis that matches baseline frames in 0–600 s scale
     t_b = np.linspace(0, total_time, len(S_pred_dce_norm))
+
+    from scipy.signal import fftconvolve
 
     # ==== Plot normalized tumor enhancement ====
     plt.figure(figsize=(7, 4))
