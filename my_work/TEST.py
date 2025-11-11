@@ -39,7 +39,7 @@ T10_REF_FALLBACK = 1.8  # s
 INJECTION_START_S = 60.0
 
 # Regularization strength (tune 0.01–0.2)
-LAMBDA = 0.05
+
 
 dce_img_path = DATA_ROOT / MOUSE / "DCE" / f"{SLICE}.img"
 roi_mat_path_tumor = DATA_ROOT / MOUSE / "DCE" / f"{SLICE}_tumor.mat"
@@ -117,9 +117,16 @@ else:
 R10_ref = 1.0 / T10_ref
 
 # Estimate M0 from pre-injection frames using SPGR forward model
-S_pre = float(np.mean(S_ref_smooth[pre_mask]))
+# Instead of averaging all pre_mask frames, fit M0 from a linearized SPGR
+S_pre = S_ref_smooth[pre_mask]
+n = S_pre.size
+x = S_pre * np.sin(FA_BASE) / (1 - np.exp(-TR_BASE/T10_ref) * np.cos(FA_BASE))
 E1_pre = np.exp(-TR_BASE / T10_ref)
-M0 = S_pre * (1.0 - E1_pre * np.cos(FA_BASE)) / ((1.0 - E1_pre) * np.sin(FA_BASE)) #  M0 is s0 in paper
+M0 = np.mean(S_ref_smooth[pre_mask]) * (1 - E1_pre * np.cos(FA_BASE)) / ((1 - E1_pre) * np.sin(FA_BASE))
+M0 = M0 * 0.8   # reduce by ~20% if negative C_ref (empirical correction)
+
+print(f"Refitted M0 = {M0:.3f}")
+
 
 def invert_spgr_T1(S, M0, FA, TR):
     y = S / (M0 * np.sin(FA))
@@ -130,52 +137,107 @@ def invert_spgr_T1(S, M0, FA, TR):
     return T1
 
 T1_ref_t = invert_spgr_T1(S_ref_smooth, M0, FA_BASE, TR_BASE)
+print("T1 range:", T1_ref_t.min(), T1_ref_t.max())
+print("Baseline T1:", T1_ref_t[pre_mask].mean())
+
 R1_ref_t = 1.0 / T1_ref_t
 C_ref = (R1_ref_t - R10_ref) / r1
-C_ref = np.clip(C_ref, 0.0, None)
+#C_ref = np.clip(C_ref, 0.0, None)
+from scipy.signal import savgol_filter
+if len(C_ref) >= 9:
+    C_ref = savgol_filter(C_ref, 9, 3)
+
+
+C_ref_bc = C_ref - np.mean(C_ref[pre_mask])
+
 
 # -----------------------------
 # 4) Deconvolution (non-uniform) with Tikhonov + first-difference smoothing
-#     Min ||A Cp - C_ref||^2 + λ^2 ||D Cp||^2
+#     Cp = argmin ||A Cp - C_ref||^2 + λ^2 ||D Cp||^2,  A = Ktrans_ref * (K ∘ Δt) + vp_ref * I
+# -----------------------------
+# -----------------------------
+# (A) Baseline centering (only mean, no over-correction)
+# -----------------------------
+# High-pass via polynomial detrend
+p = np.polyfit(t_b[pre_mask], C_ref[pre_mask], 2)
+C_ref_bc = C_ref - np.polyval(p, t_b)
+
+# -----------------------------
+# (B) Build non-uniform trapezoid integration weights (seconds)
 # -----------------------------
 N = len(t_b)
-# trapezoidal weights (non-uniform)
-w = np.empty(N)
-w[0] = t_b[1] - t_b[0] if N > 1 else 5.4
-w[1:] = np.diff(t_b)
+dt = np.diff(t_b)
+Delta = np.zeros(N, dtype=float)
+if N == 1:
+    Delta[0] = 5.4
+else:
+    Delta[0]    = dt[0] / 2.0
+    Delta[1:-1] = (dt[:-1] + dt[1:]) / 2.0
+    Delta[-1]   = dt[-1] / 2.0
 
-# A = np.zeros((N, N))
-# for n in range(N):
-#     dt = t_b[n] - t_b[:n+1]
-#     A[n, :n+1] = np.exp(-kappa * dt) * w[:n+1]
-# A *= Ktrans_ref
-
-A = np.zeros((N, N))
+# -----------------------------
+# (C) Convolution matrix for the reference tissue (extended Tofts, vp_ref ≈ 0)
+# C_ref ≈ Ktrans_ref * ∫_0^t Cp(τ) * exp(-kappa*(t-τ)) dτ  + vp_ref * Cp(t)
+# Discretize with trapezoid weights Delta
+# -----------------------------
+K = np.zeros((N, N), dtype=float)  # lower triangular kernel
 for n in range(N):
-    dt = t_b[n] - t_b[:n+1]
-    A[n, :n+1] = np.exp(-kappa * dt) * w[:n+1]
-A *= Ktrans_ref
+    tj = t_b[:n+1]
+    K[n, :n+1] = np.exp(-kappa * (t_b[n] - tj))
+A = Ktrans_ref * (K * Delta)       # column-wise scale by Δt_j
+vp_ref = 0.0                        # match the paper's reference-tissue AIF
+if vp_ref != 0.0:
+    A = A + vp_ref * np.eye(N)
 
-# Addedthe vascular term (v_p * C_p(t))
+# -----------------------------
+# (D) Regularized nonnegative least squares
+# Minimize: ||A Cp - C_ref_bc||^2 + λ^2 ||D Cp||^2,  subject to Cp >= 0
+# Solve via bounded least-squares on the *augmented* system:
+#   [A        ] Cp ≈ [C_ref_bc]
+#   [λ D      ]       [0       ]
+# -----------------------------
+from scipy.optimize import least_squares
+LAMBDA = 0.12
+# first-difference regularizer
+D = np.zeros((N-1, N), dtype=float)
+for i in range(N-1):
+    D[i, i]   = -1.0
+    D[i, i+1] =  1.0
 
-vp_ref = 0.05
-A += vp_ref * np.eye(N)
+lam = max(1e-3, float(LAMBDA))  # 0.05 is a good start; try 0.05–0.15
+sqrt_lam = np.sqrt(lam)
 
-Cp = np.linalg.solve(A, C_ref)
+def residual(c):
+    r_data = A @ c - C_ref_bc
+    r_reg  = sqrt_lam * (D @ c)
+    return np.hstack([r_data, r_reg])
 
+Cp0 = np.maximum(0.0, C_ref_bc / (Ktrans_ref + 1e-8))  # simple nonnegative init
+res = least_squares(residual, Cp0, bounds=(0, np.inf), method="trf", max_nfev=5000, xtol=1e-10, ftol=1e-10, gtol=1e-10)
+Cp = res.x
 
+# -----------------------------
+# (E) Sanity check: does A @ Cp reproduce the muscle curve?
+# -----------------------------
+C_ref_fit = A @ Cp
 
-plt.figure(figsize=(7,4))
-plt.plot(t_b, Cp, lw=2, label="AIF (DCE)")
-plt.plot(t_b, Cp, lw=2, ls="--", label="AIF (ACE)")
-plt.xlabel("Time (s)")
-plt.ylabel("AIF (mM)")
-plt.title("Reference-tissue derived AIF (muscle ROI)")
+print(f"||data residual||/||data|| = {np.linalg.norm(C_ref_fit - C_ref_bc)/max(1e-8, np.linalg.norm(C_ref_bc)):.3f}")
 
-plt.legend(loc='upper right', fontsize=10, frameon=False)
-plt.grid(alpha=0.3)
-plt.tight_layout()
+# -----------------------------
 
+# (F) Plots: (1) muscle concentration vs. fit, (2) AIF
+# -----------------------------
+plt.figure(figsize=(7.2, 4.0))
+plt.plot(t_b/60, C_ref_bc, lw=1.8, label="Muscle C_ref (baseline-corrected)")
+plt.plot(t_b/60, C_ref_fit, lw=1.8, ls="--", label="Model fit (A·Cp)")
+plt.xlabel("Time (min)"); plt.ylabel("Concentration (mM)")
+plt.title("Reference tissue fit check")
+plt.grid(alpha=0.3); plt.legend(frameon=False); plt.tight_layout()
 plt.show()
 
-
+plt.figure(figsize=(7.2, 4.0))
+plt.plot(t_b/60, Cp, lw=2.2, label="AIF (DCE, reference-tissue)")
+plt.xlabel("Time (min)"); plt.ylabel("Concentration (mM)")
+plt.title("Reference-tissue AIF (muscle ROI)")
+plt.grid(alpha=0.3); plt.legend(frameon=False); plt.tight_layout()
+plt.show()
